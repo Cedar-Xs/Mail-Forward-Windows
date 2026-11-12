@@ -40,10 +40,12 @@ class PopHandler(LocalProtocolHandler):
             argument = parts[1] if len(parts) == 2 else ""
             self.server.commands.append(command)
             if command == "USER":
-                self.wfile.write(b"+OK user accepted\r\n")
+                self.wfile.write(getattr(self.server, "user_reply", b"+OK user accepted") + b"\r\n")
             elif command == "PASS":
                 authenticated = argument == "fake-password"
-                self.wfile.write(b"+OK authenticated\r\n" if authenticated else b"-ERR auth rejected\r\n")
+                reply = (b"+OK authenticated" if authenticated else
+                         getattr(self.server, "password_rejection", b"-ERR auth rejected"))
+                self.wfile.write(reply + b"\r\n")
             elif command == "QUIT":
                 self.wfile.write(b"+OK goodbye\r\n")
                 return
@@ -193,7 +195,44 @@ class ProtocolIntegrationTests(unittest.TestCase):
             self.assertFalse(result)
             self.assertTrue(any(e.get("key") == "network" and e.get("level") == "ok" for e in events))
             self.assertTrue(any(e.get("key") == "login" and e.get("level") == "error" for e in events))
+            self.assertTrue(any("PASS" in e.get("text", "") and "-ERR auth rejected" in e["text"]
+                                for e in events if e.get("key") == "login"))
             self.assertEqual(smtp.delivered, [])
+
+    def test_real_pop_reports_user_policy_rejection_without_submitting_password(self):
+        with server_instance(ThreadedTCP, PopHandler) as pop:
+            pop.user_reply = b"-ERR [AUTH] POP3 access disabled"
+            cfg = Config(pop_host="127.0.0.1", pop_port=pop.server_address[1], pop_security="不加密",
+                         pop_user="user@example.test", pop_password="fake-password", wecom_enabled=False,
+                         remember_credentials=False, timeout_seconds=3)
+            events = []
+            result = diagnose(cfg, lambda kind, **data: events.append({"kind": kind, **data}), mailbox_only=True)
+            self.assertFalse(result.mailbox_ok)
+            self.assertIn("USER", pop.commands)
+            self.assertIn("QUIT", pop.commands)
+            for command in ("PASS", "STAT", "UIDL", "RETR", "DELE"):
+                self.assertNotIn(command, pop.commands)
+            self.assertTrue(any(e.get("key") == "login" and "USER" in e.get("text", "")
+                                and "-ERR [AUTH] POP3 access disabled" in e["text"] for e in events))
+
+    def test_real_pop_echoed_credentials_are_hidden_in_status_and_log(self):
+        with server_instance(ThreadedTCP, PopHandler) as pop:
+            cfg = Config(pop_host="127.0.0.1", pop_port=pop.server_address[1], pop_security="不加密",
+                         pop_user="user@example.test", pop_password="fake-rejected-password",
+                         wecom_enabled=False, remember_credentials=False, timeout_seconds=3)
+            pop.password_rejection = f"-ERR [AUTH] 客户端拒绝 {cfg.pop_user} {cfg.pop_password}".encode("utf-8")
+            events = []
+            result = diagnose(cfg, lambda kind, **data: events.append({"kind": kind, **data}), mailbox_only=True)
+            self.assertFalse(result.mailbox_ok)
+            for kind, level in (("status", "error"), ("log", "ERROR")):
+                messages = [e["text"] for e in events if e["kind"] == kind and e.get("level") == level]
+                self.assertEqual(len(messages), 1)
+                self.assertIn("PASS", messages[0])
+                self.assertIn("-ERR [AUTH] 客户端拒绝", messages[0])
+                self.assertNotIn(cfg.pop_user, messages[0])
+                self.assertNotIn(cfg.pop_password, messages[0])
+            self.assertNotIn("RETR", pop.commands)
+            self.assertNotIn("DELE", pop.commands)
 
     def test_real_http_json_webhook_transport_on_loopback_only(self):
         with server_instance(ThreadingHTTPServer, WebhookHandler) as webhook:

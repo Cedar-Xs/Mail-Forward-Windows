@@ -72,6 +72,44 @@ def safe_error(exc: Exception, cfg: Config) -> str:
     return message.replace("\r", " ").replace("\n", " ")[:800]
 
 
+def pop_login_error(exc: poplib.error_proto, cfg: Config, command: str) -> str:
+    """Keep the server's explanation, but never expose echoed credentials."""
+    reply = exc.args[0] if exc.args else ""
+    identities = {cfg.pop_user, cfg.smtp_user, cfg.pop_host, cfg.smtp_host}
+    private_values = identities | {getattr(cfg, key) for key in SECRET_KEYS}
+    private_values.discard("")
+    if isinstance(reply, bytes):
+        # Redact bytes too: mixed/broken encodings must not disguise a secret
+        # from the later text replacement. Never use str(bytes) for display.
+        encoded_values = {}
+        for value in private_values:
+            for encoding in ("utf-8", "gb18030"):
+                try:
+                    encoded_values[value.encode(encoding)] = re.IGNORECASE if value in identities else 0
+                except UnicodeEncodeError:
+                    pass
+        for value in sorted(encoded_values, key=len, reverse=True):
+            reply = re.sub(re.escape(value), b"[redacted]", reply, flags=encoded_values[value])
+        for encoding in ("utf-8", "gb18030"):
+            try:
+                reply = reply.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                pass
+        else:
+            reply = reply.decode("utf-8", errors="replace")
+    else:
+        reply = str(reply)
+    for value in sorted(private_values, key=len, reverse=True):
+        flags = re.IGNORECASE if value in identities else 0
+        reply = re.sub(re.escape(value), "[redacted]", reply, flags=flags)
+    reply = safe_error(RuntimeError(reply), cfg)
+    reply = "".join(char if char.isprintable() else " " for char in reply).strip()
+    reply = reply[:600] or "服务器未提供具体错误说明。"
+    step = "账号提交" if command == "USER" else "密码验证"
+    return f"POP3 登录失败（{step} / {command}）；服务器响应：{reply}"
+
+
 def pop_context(cfg: Config) -> ssl.SSLContext:
     context = ssl.create_default_context(cafile=cfg.pop_ca_file or None)
     if not cfg.pop_verify_tls:
@@ -121,13 +159,17 @@ def pop_session(cfg: Config, emit=silent_emit, stop_event=None):
                 emit("status", key="network", level="ok", text="邮箱连接正常")
                 stage = "login"
                 emit("status", key="login", level="busy", text="正在验证账号…")
+                command = "USER"
                 try:
                     connection.user(cfg.pop_user)
                     check_cancel(stop_event)
+                    command = "PASS"
                     connection.pass_(cfg.pop_password)
                 except poplib.error_proto as exc:
                     check_cancel(stop_event)
-                    raise TransportError("login", "POP3 登录被拒绝；请检查账号、密码及 POP3 权限。") from exc
+                    # Suppress the original (possibly credential-echoing) reply
+                    # in tracebacks as well as in the status/log message.
+                    raise TransportError("login", pop_login_error(exc, cfg, command)) from None
                 check_cancel(stop_event)
                 emit("status", key="login", level="ok", text="账号登录成功")
                 stage = "mailbox"
