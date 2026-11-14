@@ -79,7 +79,7 @@ class ExclusionDeliveryTests(unittest.TestCase):
         self.events = []
         self.engine = Forwarder(self.cfg, self.folder, threading.Event(),
                                 lambda kind, **data: self.events.append({"kind": kind, **data}))
-        self.clock = patch("mailclient.engine.time.monotonic", side_effect=itertools.count(10, 10))
+        self.clock = patch("mailclient.health.time.monotonic", side_effect=itertools.count(10, 10))
         self.clock.start()
 
     def tearDown(self):
@@ -90,6 +90,9 @@ class ExclusionDeliveryTests(unittest.TestCase):
     @contextmanager
     def mailbox(self, messages):
         class Pop:
+            def stat(self):
+                return len(messages), 100
+
             def uidl(self):
                 return b"+OK", [f"{i} {uid}".encode() for i, (uid, _) in enumerate(messages, 1)], 0
 

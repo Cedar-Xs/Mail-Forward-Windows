@@ -21,6 +21,12 @@ class StateStore:
                 ignored INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (account, uid)
             );
+            CREATE TABLE IF NOT EXISTS connectivity (
+                account TEXT PRIMARY KEY,
+                failures INTEGER NOT NULL DEFAULT 0,
+                failure_sent_at REAL, success_sent_at REAL,
+                failure_attempt_at REAL, success_attempt_at REAL
+            );
             """)
         except Exception:
             self.db.close()
@@ -57,6 +63,26 @@ class StateStore:
             raise ValueError("Unknown channel")
         with self.db:
             self.db.execute(f"UPDATE messages SET {channel}=1 WHERE account=? AND uid=?", (self.account, uid))
+
+    def load_connectivity(self) -> dict:
+        keys = ("failures", "failure_sent_at", "success_sent_at",
+                "failure_attempt_at", "success_attempt_at")
+        row = self.db.execute(
+            "SELECT failures,failure_sent_at,success_sent_at,failure_attempt_at,success_attempt_at "
+            "FROM connectivity WHERE account=?", (self.account,)).fetchone()
+        return dict(zip(keys, row or (0, None, None, None, None)))
+
+    def save_connectivity(self, record: dict) -> None:
+        keys = ("failures", "failure_sent_at", "success_sent_at",
+                "failure_attempt_at", "success_attempt_at")
+        with self.db:
+            self.db.execute(
+                "INSERT INTO connectivity(account,failures,failure_sent_at,success_sent_at,"
+                "failure_attempt_at,success_attempt_at) VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(account) DO UPDATE SET failures=excluded.failures,"
+                "failure_sent_at=excluded.failure_sent_at,success_sent_at=excluded.success_sent_at,"
+                "failure_attempt_at=excluded.failure_attempt_at,success_attempt_at=excluded.success_attempt_at",
+                (self.account, *(record[key] for key in keys)))
 
     def close(self) -> None:
         self.db.close()

@@ -72,6 +72,44 @@ def safe_error(exc: Exception, cfg: Config) -> str:
     return message.replace("\r", " ").replace("\n", " ")[:800]
 
 
+def pop_login_error(exc: poplib.error_proto, cfg: Config, command: str) -> str:
+    """Keep the server's explanation, but never expose echoed credentials."""
+    reply = exc.args[0] if exc.args else ""
+    identities = {cfg.pop_user, cfg.smtp_user, cfg.pop_host, cfg.smtp_host}
+    private_values = identities | {getattr(cfg, key) for key in SECRET_KEYS}
+    private_values.discard("")
+    if isinstance(reply, bytes):
+        # Redact bytes too: mixed/broken encodings must not disguise a secret
+        # from the later text replacement. Never use str(bytes) for display.
+        encoded_values = {}
+        for value in private_values:
+            for encoding in ("utf-8", "gb18030"):
+                try:
+                    encoded_values[value.encode(encoding)] = re.IGNORECASE if value in identities else 0
+                except UnicodeEncodeError:
+                    pass
+        for value in sorted(encoded_values, key=len, reverse=True):
+            reply = re.sub(re.escape(value), b"[redacted]", reply, flags=encoded_values[value])
+        for encoding in ("utf-8", "gb18030"):
+            try:
+                reply = reply.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                pass
+        else:
+            reply = reply.decode("utf-8", errors="replace")
+    else:
+        reply = str(reply)
+    for value in sorted(private_values, key=len, reverse=True):
+        flags = re.IGNORECASE if value in identities else 0
+        reply = re.sub(re.escape(value), "[redacted]", reply, flags=flags)
+    reply = safe_error(RuntimeError(reply), cfg)
+    reply = "".join(char if char.isprintable() else " " for char in reply).strip()
+    reply = reply[:600] or "服务器未提供具体错误说明。"
+    step = "账号提交" if command == "USER" else "密码验证"
+    return f"POP3 登录失败（{step} / {command}）；服务器响应：{reply}"
+
+
 def pop_context(cfg: Config) -> ssl.SSLContext:
     context = ssl.create_default_context(cafile=cfg.pop_ca_file or None)
     if not cfg.pop_verify_tls:
@@ -121,13 +159,17 @@ def pop_session(cfg: Config, emit=silent_emit, stop_event=None):
                 emit("status", key="network", level="ok", text="邮箱连接正常")
                 stage = "login"
                 emit("status", key="login", level="busy", text="正在验证账号…")
+                command = "USER"
                 try:
                     connection.user(cfg.pop_user)
                     check_cancel(stop_event)
+                    command = "PASS"
                     connection.pass_(cfg.pop_password)
                 except poplib.error_proto as exc:
                     check_cancel(stop_event)
-                    raise TransportError("login", "POP3 登录被拒绝；请检查账号、密码及 POP3 权限。") from exc
+                    # Suppress the original (possibly credential-echoing) reply
+                    # in tracebacks as well as in the status/log message.
+                    raise TransportError("login", pop_login_error(exc, cfg, command)) from None
                 check_cancel(stop_event)
                 emit("status", key="login", level="ok", text="账号登录成功")
                 stage = "mailbox"
@@ -159,13 +201,16 @@ def uidl_list(connection) -> list[tuple[int, str]]:
     return sorted(result)
 
 
-def wecom_payload(cfg: Config, mail: Mail) -> dict:
+def wecom_payload(cfg: Config, mail: Mail, *, notification: bool = False) -> dict:
     attachment_names = [item.name for item in mail.attachments]
     attachment_names += [name + "（超限未附带）" for name in mail.omitted]
     attachments = "、".join(attachment_names)
     title = f"【验证码：{mail.code}】{mail.subject}" if mail.code else f"【新邮件】{mail.subject}"
+    if notification:
+        title = f"【{mail.subject}】"
     if cfg.wecom_type == "text":
-        content = f"{title}\n发件人：{mail.sender}\n时间：{mail.date}\n"
+        content = (f"{title}\n时间：{mail.date}\n" if notification else
+                   f"{title}\n发件人：{mail.sender}\n时间：{mail.date}\n")
         if attachments:
             content += f"附件：{attachments}\n"
         content += "----------------\n" + (mail.plain or "(正文为空)")
@@ -179,7 +224,8 @@ def wecom_payload(cfg: Config, mail: Mail) -> dict:
             body["mentioned_list"] = members
         return {"msgtype": "text", "text": body}
     banner = f'### 验证码：<font color="warning">{mail.code}</font>\n' if mail.code else "### 收到新邮件\n"
-    content = (banner + f"> 主题：{html.escape(mail.subject)}\n"
+    content = (f"### {html.escape(mail.subject)}\n> 时间：{html.escape(mail.date)}\n" if notification else
+               banner + f"> 主题：{html.escape(mail.subject)}\n"
                f"> 发件人：{html.escape(mail.sender)}\n> 时间：{html.escape(mail.date)}\n")
     if attachments:
         content += f"> 附件：{html.escape(attachments)}\n"
@@ -221,9 +267,9 @@ def open_webhook(request, timeout, stop_event):
     return opener.open(request, timeout=timeout)
 
 
-def send_wecom(cfg: Config, mail: Mail, stop_event=None) -> None:
+def send_wecom(cfg: Config, mail: Mail, stop_event=None, *, notification: bool = False) -> None:
     check_cancel(stop_event)
-    data = json.dumps(wecom_payload(cfg, mail), ensure_ascii=False).encode("utf-8")
+    data = json.dumps(wecom_payload(cfg, mail, notification=notification), ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(cfg.wecom_webhook, data=data,
                                      headers={"Content-Type": "application/json; charset=utf-8"}, method="POST")
     try:
@@ -352,9 +398,11 @@ def test_mail() -> Mail:
                 plain="这是一条由客户端主动发送的测试通知。收到此消息表示当前转发通道可用。")
 
 
-def diagnose(cfg: Config, emit=silent_emit, mailbox_only: bool = False, stop_event=None) -> DiagnosticResult:
+def diagnose(cfg: Config, emit=silent_emit, mailbox_only: bool = False, stop_event=None,
+             connectivity=None) -> DiagnosticResult:
     """Explicit UI action. Enabled routes receive real, non-sensitive test messages."""
     result = DiagnosticResult()
+    mailbox_error = None
     if stop_event is not None and stop_event.is_set():
         result.cancelled = True
         return result
@@ -393,10 +441,19 @@ def diagnose(cfg: Config, emit=silent_emit, mailbox_only: bool = False, stop_eve
             result.cancelled = True
             return result
         key = exc.stage if isinstance(exc, TransportError) else "mailbox"
+        mailbox_error = exc
         emit("status", key=key, level="error", text=safe_error(exc, cfg))
         emit("log", level="ERROR", text="邮箱检测失败：" + safe_error(exc, cfg))
     if mailbox_only:
         return result
+    notification_result = None
+    if connectivity is not None:
+        try:
+            notification_result = (connectivity.success(count) if result.mailbox_ok else
+                                   connectivity.failure(mailbox_error))
+        except Cancelled:
+            result.cancelled = True
+            return result
     for channel, enabled, sender in (("wecom", cfg.wecom_enabled, send_wecom),
                                       ("smtp", cfg.smtp_enabled, send_smtp)):
         if not enabled:
@@ -408,9 +465,14 @@ def diagnose(cfg: Config, emit=silent_emit, mailbox_only: bool = False, stop_eve
         result.channels[channel] = False
         emit("status", key=channel, level="busy", text="正在发送测试通知…")
         try:
-            sender(cfg, test_mail(), stop_event=stop_event)
+            if channel == "wecom" and connectivity is not None:
+                if notification_result is not True:
+                    connectivity.deliver(test_mail(), sender=sender)
+            else:
+                sender(cfg, test_mail(), stop_event=stop_event)
             result.channels[channel] = True
-            text = "接口已接受测试消息" if channel == "wecom" else "SMTP 已接受测试邮件"
+            text = ("接口已接受邮箱状态通知" if channel == "wecom" and notification_result is True else
+                    "接口已接受测试消息" if channel == "wecom" else "SMTP 已接受测试邮件")
             emit("status", key=channel, level="ok", text=text)
             emit("log", level="INFO", text=text + "；请在对应通道确认收到。")
         except Exception as exc:

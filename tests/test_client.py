@@ -401,6 +401,8 @@ class TransportTests(unittest.TestCase):
 class FakePop:
     def __init__(self, messages):
         self.messages = messages
+    def stat(self):
+        return len(self.messages), 100
     def uidl(self):
         return b"+OK", [f"{i + 1} {uid}".encode() for i, (uid, _) in enumerate(self.messages)], 0
     def retr(self, number):
@@ -411,6 +413,9 @@ class FakePop:
 
 class EngineTests(unittest.TestCase):
     def setUp(self):
+        health_sender = patch("mailclient.health.send_wecom")
+        health_sender.start()
+        self.addCleanup(health_sender.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.folder = Path(self.tmp.name)
         self.cfg = valid_config(smtp_enabled=True, keywords="", test_latest_first_run=False)
@@ -419,7 +424,7 @@ class EngineTests(unittest.TestCase):
         self.stop = threading.Event()
         self.forwarder = Forwarder(self.cfg, self.folder, self.stop,
                                     lambda kind, **data: self.events.append({"kind": kind, **data}))
-        self.clock = patch("mailclient.engine.time.monotonic", side_effect=itertools.count(10, 10))
+        self.clock = patch("mailclient.health.time.monotonic", side_effect=itertools.count(10, 10))
         self.clock.start()
 
     def tearDown(self):

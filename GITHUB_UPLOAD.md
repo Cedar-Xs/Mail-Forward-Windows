@@ -1,10 +1,9 @@
-# 更新 GitHub 仓库到 v1.3.2
+# GitHub 更新与 v1.4.0 下载
 
-1. 打开已有仓库 https://github.com/xsisme/mail-forwarder-client ，点击 Add file → Upload files。
-2. 解压 `MailForwarderClient_v1.3.2_Windows.zip`，打开里面的 `MailForwarderClient` 文件夹。
-3. 把文件夹内的源码文件及 `mailclient`、`tests` 文件夹拖入网页，保持目录结构。上传后 `README.md`、`app.py` 应在仓库根目录，不要多套一层 `MailForwarderClient`，也不要把 ZIP 当源码上传。
-4. 确认新文件 `mailclient/cancellation.py`、`tests/test_exclusions.py` 和 `tests/test_shutdown.py` 已包含，已有文件会按同路径更新。
-5. `.gitignore` 可能被文件选择器隐藏，请确认它也上传；必要时用 Add file → Create new file 单独创建。网页上传不会应用忽略规则，请从刚解压的干净包上传，避免混入运行后的配置、日志或构建目录。
-6. 提交说明可填 `Fix Windows blocked-send test synchronization (v1.3.2)`，检查变更后点击 Commit changes。
+仓库：[Cedar-Xs/mail-forward-topsec](https://github.com/Cedar-Xs/mail-forward-topsec)。
 
-本包以公开仓库为基础，默认 POP3 主机、邮箱账号、排除名单及凭据均为空，示例只使用保留示例域名。旧客户端在本机保存的配置和转发记录仍可沿用。没有预编译 Windows EXE；在 Windows 上执行 `build_windows.bat` 生成新版。
+Windows 使用者可从 [Releases](https://github.com/Cedar-Xs/mail-forward-topsec/releases) 下载 `MailForwarderClient-v1.4.0-Windows.zip`，解压后运行 `MailForwarderClient.exe`。已有账号、加密凭据、历史邮件基线和投递记录继续使用本机原数据目录；多账号继续使用包内同名的 A/B 启动脚本。
+
+开发更新使用独立分支和 Pull Request。完成修改及版本说明后，通过 Windows Python 3.11 / 3.12 完整测试、源码窗口检查和打包 EXE 窗口检查；合并后确认最终 main 提交的 CI 通过，再为同一提交创建一个 annotated tag 和 GitHub Release，附上对应已验证的 Windows ZIP。
+
+源码运行和本地打包方法见 README。发布包只包含程序和启动脚本，私有账号、密码、Webhook、配置、日志及数据库不随包分发。
