@@ -5,28 +5,61 @@ from datetime import datetime
 from pathlib import Path
 import sqlite3
 import threading
-import time
 
 from .config import Config, split_list
 from .cancellation import check_cancel
 from .parsing import is_excluded_sender, matches_keywords, parse_mail
 from .state import StateStore
+from .health import ConnectivityMonitor
 from .transports import (Cancelled, TransportError, pop_session, safe_error, send_smtp,
                          send_wecom, silent_emit, uidl_list)
 
 
 class Forwarder:
-    def __init__(self, cfg: Config, folder: Path, stop: threading.Event, emit=silent_emit):
+    def __init__(self, cfg: Config, folder: Path, stop: threading.Event, emit=silent_emit,
+                 connectivity=None):
         self.cfg, self.folder, self.stop, self.emit = cfg, folder, stop, emit
-        self.last_wecom = 0.0
+        self.connectivity = connectivity
+        self._last_wecom = 0.0
+
+    @property
+    def last_wecom(self):
+        return self.connectivity.last_wecom if self.connectivity is not None else self._last_wecom
+
+    @last_wecom.setter
+    def last_wecom(self, value):
+        self._last_wecom = value
+        if self.connectivity is not None:
+            self.connectivity.last_wecom = value
 
     def poll_once(self, state: StateStore) -> None:
         if self.stop.is_set():
             return
+        if self.connectivity is None:
+            self.connectivity = ConnectivityMonitor(self.cfg, state, self.stop, self.emit)
+            self.connectivity.last_wecom = self._last_wecom
+        self._mailbox_ready = False
+        try:
+            self._poll_mailbox(state)
+        except (Cancelled, sqlite3.DatabaseError):
+            raise
+        except Exception as exc:
+            check_cancel(self.stop)
+            if not self._mailbox_ready:
+                self.connectivity.failure(exc)
+            raise
+
+    def _poll_mailbox(self, state: StateStore) -> None:
         with pop_session(self.cfg, self.emit, self.stop) as connection:
+            count, _ = connection.stat()
+            check_cancel(self.stop)
             items = uidl_list(connection)
             check_cancel(self.stop)
-            self.emit("status", key="mailbox", level="ok", text=f"{len(items)} 封邮件 · UIDL 正常")
+            self._mailbox_ready = True
+            self.emit("status", key="mailbox", level="ok", text=f"{count} 封邮件 · UIDL 正常")
+            if len(items) != count:
+                self.emit("log", level="WARNING", text="服务器 STAT 与 UIDL 数量不一致，转发以 UIDL 列表为准。")
+            self.connectivity.success(count)
             if not state.initialized:
                 state.initialize([uid for _, uid in items], self.cfg.test_latest_first_run)
                 self.emit("log", level="INFO", text=f"已建立 {len(items)} 封历史邮件的基线；"
@@ -77,14 +110,11 @@ class Forwarder:
                         break
                     if not enabled or (record and record[index]):
                         continue
-                    if channel == "wecom":
-                        # Space webhook attempts by >=3.2s (including failed attempts).
-                        delay = max(0.0, 3.2 - (time.monotonic() - self.last_wecom))
-                        if self.stop.wait(delay):
-                            break
-                        self.last_wecom = time.monotonic()
                     try:
-                        sender(self.cfg, mail, stop_event=self.stop)
+                        if channel == "wecom":
+                            self.connectivity.deliver(mail, sender=sender)
+                        else:
+                            sender(self.cfg, mail, stop_event=self.stop)
                     except Cancelled:
                         raise
                     except Exception as exc:

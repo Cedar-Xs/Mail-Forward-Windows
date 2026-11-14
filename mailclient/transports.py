@@ -201,13 +201,16 @@ def uidl_list(connection) -> list[tuple[int, str]]:
     return sorted(result)
 
 
-def wecom_payload(cfg: Config, mail: Mail) -> dict:
+def wecom_payload(cfg: Config, mail: Mail, *, notification: bool = False) -> dict:
     attachment_names = [item.name for item in mail.attachments]
     attachment_names += [name + "（超限未附带）" for name in mail.omitted]
     attachments = "、".join(attachment_names)
     title = f"【验证码：{mail.code}】{mail.subject}" if mail.code else f"【新邮件】{mail.subject}"
+    if notification:
+        title = f"【{mail.subject}】"
     if cfg.wecom_type == "text":
-        content = f"{title}\n发件人：{mail.sender}\n时间：{mail.date}\n"
+        content = (f"{title}\n时间：{mail.date}\n" if notification else
+                   f"{title}\n发件人：{mail.sender}\n时间：{mail.date}\n")
         if attachments:
             content += f"附件：{attachments}\n"
         content += "----------------\n" + (mail.plain or "(正文为空)")
@@ -221,7 +224,8 @@ def wecom_payload(cfg: Config, mail: Mail) -> dict:
             body["mentioned_list"] = members
         return {"msgtype": "text", "text": body}
     banner = f'### 验证码：<font color="warning">{mail.code}</font>\n' if mail.code else "### 收到新邮件\n"
-    content = (banner + f"> 主题：{html.escape(mail.subject)}\n"
+    content = (f"### {html.escape(mail.subject)}\n> 时间：{html.escape(mail.date)}\n" if notification else
+               banner + f"> 主题：{html.escape(mail.subject)}\n"
                f"> 发件人：{html.escape(mail.sender)}\n> 时间：{html.escape(mail.date)}\n")
     if attachments:
         content += f"> 附件：{html.escape(attachments)}\n"
@@ -263,9 +267,9 @@ def open_webhook(request, timeout, stop_event):
     return opener.open(request, timeout=timeout)
 
 
-def send_wecom(cfg: Config, mail: Mail, stop_event=None) -> None:
+def send_wecom(cfg: Config, mail: Mail, stop_event=None, *, notification: bool = False) -> None:
     check_cancel(stop_event)
-    data = json.dumps(wecom_payload(cfg, mail), ensure_ascii=False).encode("utf-8")
+    data = json.dumps(wecom_payload(cfg, mail, notification=notification), ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(cfg.wecom_webhook, data=data,
                                      headers={"Content-Type": "application/json; charset=utf-8"}, method="POST")
     try:
@@ -394,9 +398,11 @@ def test_mail() -> Mail:
                 plain="这是一条由客户端主动发送的测试通知。收到此消息表示当前转发通道可用。")
 
 
-def diagnose(cfg: Config, emit=silent_emit, mailbox_only: bool = False, stop_event=None) -> DiagnosticResult:
+def diagnose(cfg: Config, emit=silent_emit, mailbox_only: bool = False, stop_event=None,
+             connectivity=None) -> DiagnosticResult:
     """Explicit UI action. Enabled routes receive real, non-sensitive test messages."""
     result = DiagnosticResult()
+    mailbox_error = None
     if stop_event is not None and stop_event.is_set():
         result.cancelled = True
         return result
@@ -435,10 +441,19 @@ def diagnose(cfg: Config, emit=silent_emit, mailbox_only: bool = False, stop_eve
             result.cancelled = True
             return result
         key = exc.stage if isinstance(exc, TransportError) else "mailbox"
+        mailbox_error = exc
         emit("status", key=key, level="error", text=safe_error(exc, cfg))
         emit("log", level="ERROR", text="邮箱检测失败：" + safe_error(exc, cfg))
     if mailbox_only:
         return result
+    notification_result = None
+    if connectivity is not None:
+        try:
+            notification_result = (connectivity.success(count) if result.mailbox_ok else
+                                   connectivity.failure(mailbox_error))
+        except Cancelled:
+            result.cancelled = True
+            return result
     for channel, enabled, sender in (("wecom", cfg.wecom_enabled, send_wecom),
                                       ("smtp", cfg.smtp_enabled, send_smtp)):
         if not enabled:
@@ -450,9 +465,14 @@ def diagnose(cfg: Config, emit=silent_emit, mailbox_only: bool = False, stop_eve
         result.channels[channel] = False
         emit("status", key=channel, level="busy", text="正在发送测试通知…")
         try:
-            sender(cfg, test_mail(), stop_event=stop_event)
+            if channel == "wecom" and connectivity is not None:
+                if notification_result is not True:
+                    connectivity.deliver(test_mail(), sender=sender)
+            else:
+                sender(cfg, test_mail(), stop_event=stop_event)
             result.channels[channel] = True
-            text = "接口已接受测试消息" if channel == "wecom" else "SMTP 已接受测试邮件"
+            text = ("接口已接受邮箱状态通知" if channel == "wecom" and notification_result is True else
+                    "接口已接受测试消息" if channel == "wecom" else "SMTP 已接受测试邮件")
             emit("status", key=channel, level="ok", text=text)
             emit("log", level="INFO", text=text + "；请在对应通道确认收到。")
         except Exception as exc:

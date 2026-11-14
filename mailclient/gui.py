@@ -19,6 +19,8 @@ from . import __version__
 from .config import Config, ConfigError, ConfigStore
 from .cancellation import CancellationEvent
 from .engine import Forwarder
+from .health import ConnectivityMonitor
+from .state import StateStore
 from .transports import diagnose, safe_error
 from .ios_layout import IOSLayout
 from .ios_widgets import COLORS
@@ -129,7 +131,12 @@ class ClientWindow(IOSLayout):
         already_checked = self.checked_config == cfg
 
         def job():
+            health_state = None
             try:
+                connectivity = None
+                if mode != "mailbox":
+                    health_state = StateStore(self.folder / "delivery.sqlite3", cfg.account_id)
+                    connectivity = ConnectivityMonitor(cfg, health_state, self.stop_event, self.post)
                 if mode == "mailbox":
                     ok = diagnose(cfg, self.post, mailbox_only=True, stop_event=self.stop_event)
                     self.post("phase", text="检测已停止" if ok.cancelled else ("邮箱检测完成" if ok else "邮箱检测失败"))
@@ -137,7 +144,7 @@ class ClientWindow(IOSLayout):
                     if mode == "start" and already_checked:
                         ok, can_start = True, True
                     else:
-                        result = diagnose(cfg, self.post, stop_event=self.stop_event)
+                        result = diagnose(cfg, self.post, stop_event=self.stop_event, connectivity=connectivity)
                         ok, can_start = bool(result), result.can_forward
                     if can_start:
                         self.post("diagnosed", config=replace(cfg))
@@ -145,7 +152,7 @@ class ClientWindow(IOSLayout):
                         if not ok:
                             self.post("log", level="WARNING", text="部分通道检测失败：可用通道继续转发，失败通道会按轮询重试。")
                         self.post("phase", text="正在转发 · 自动轮询")
-                        engine = Forwarder(cfg, self.folder, self.stop_event, self.post)
+                        engine = Forwarder(cfg, self.folder, self.stop_event, self.post, connectivity=connectivity)
                         engine.last_wecom = time.monotonic()
                         engine.run()
                         self.post("phase", text="转发已停止")
@@ -156,7 +163,11 @@ class ClientWindow(IOSLayout):
                 self.post("log", level="ERROR", text="任务已停止：" + safe_error(exc, cfg))
                 self.post("phase", text="任务异常 · 请查看日志")
             finally:
-                self.post("finished")
+                try:
+                    if health_state is not None:
+                        health_state.close()
+                finally:
+                    self.post("finished")
 
         self.worker = threading.Thread(target=job, name="mail-forwarder", daemon=True)
         self.worker.start()
