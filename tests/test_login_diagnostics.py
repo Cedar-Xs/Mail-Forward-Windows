@@ -22,7 +22,7 @@ class LoginDiagnosticsTests(unittest.TestCase):
         connection = MagicMock()
         method = connection.user if command == "USER" else connection.pass_
         method.side_effect = poplib.error_proto(reply)
-        with patch("mailclient.transports.poplib.POP3_SSL", return_value=connection):
+        with patch("mailclient.transports._ClosingPOP3SSL", return_value=connection):
             with self.assertRaises(TransportError) as caught:
                 with pop_session(cfg or self.cfg):
                     self.fail("Rejected authentication must not yield a mailbox")
@@ -46,7 +46,7 @@ class LoginDiagnosticsTests(unittest.TestCase):
                 events = []
                 with patch("mailclient.transports.socket.getaddrinfo"), \
                      patch("mailclient.transports.socket.create_connection"), \
-                     patch("mailclient.transports.poplib.POP3_SSL", return_value=connection), \
+                     patch("mailclient.transports._ClosingPOP3SSL", return_value=connection), \
                      patch("mailclient.transports.send_wecom") as webhook, \
                      patch("mailclient.transports.send_smtp") as smtp:
                     result = diagnose(self.cfg, lambda kind, **data: events.append((kind, data)),
@@ -96,7 +96,7 @@ class LoginDiagnosticsTests(unittest.TestCase):
         events = []
         with patch("mailclient.transports.socket.getaddrinfo"), \
              patch("mailclient.transports.socket.create_connection"), \
-             patch("mailclient.transports.poplib.POP3_SSL", return_value=connection):
+             patch("mailclient.transports._ClosingPOP3SSL", return_value=connection):
             diagnose(self.cfg, lambda kind, **data: events.append((kind, data)), mailbox_only=True)
         texts = " ".join(data.get("text", "") for _, data in events)
         self.assertNotIn(self.cfg.pop_user, texts)
@@ -136,7 +136,7 @@ class LoginDiagnosticsTests(unittest.TestCase):
             stop.set()
             raise poplib.error_proto(b"-ERR cancelled login")
         connection.pass_.side_effect = reject
-        with patch("mailclient.transports.poplib.POP3_SSL", return_value=connection):
+        with patch("mailclient.transports._ClosingPOP3SSL", return_value=connection):
             with self.assertRaises(Cancelled):
                 with pop_session(self.cfg, stop_event=stop):
                     self.fail("Cancelled login must not yield a mailbox")
@@ -145,7 +145,7 @@ class LoginDiagnosticsTests(unittest.TestCase):
     def test_successful_login_preserves_credentials_and_existing_flow(self):
         cfg = replace(self.cfg, pop_password=" password with spaces ")
         connection = MagicMock()
-        with patch("mailclient.transports.poplib.POP3_SSL", return_value=connection):
+        with patch("mailclient.transports._ClosingPOP3SSL", return_value=connection):
             with pop_session(cfg) as mailbox:
                 self.assertIs(mailbox, connection)
         connection.user.assert_called_once_with(cfg.pop_user)
@@ -172,7 +172,7 @@ class LoginDiagnosticsTests(unittest.TestCase):
                     events = []
                     with patch("mailclient.transports.socket.getaddrinfo"), \
                          patch("mailclient.transports.socket.create_connection"), \
-                         patch("mailclient.transports.poplib.POP3_SSL", return_value=connection):
+                         patch("mailclient.transports._ClosingPOP3SSL", return_value=connection):
                         result = diagnose(cfg, lambda kind, **data: events.append((kind, data)),
                                           mailbox_only=True)
                     self.assertFalse(result.mailbox_ok)
@@ -223,7 +223,7 @@ class LoginDiagnosticsTests(unittest.TestCase):
                                                sender=lambda cfg, mail, **kw: sent.append(mail))
                 with patch("mailclient.transports.socket.getaddrinfo"), \
                      patch("mailclient.transports.socket.create_connection"), \
-                     patch("mailclient.transports.poplib.POP3_SSL", return_value=connection), \
+                     patch("mailclient.transports._ClosingPOP3SSL", return_value=connection), \
                      patch("mailclient.transports.send_wecom"), \
                      patch("mailclient.health.time.monotonic", side_effect=itertools.count(10, 10)):
                     for _ in range(3):

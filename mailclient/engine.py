@@ -55,6 +55,8 @@ class Forwarder:
                 count, _ = connection.stat()
                 check_cancel(self.stop)
                 items = uidl_list(connection)
+            except Cancelled:
+                raise
             except Exception as exc:
                 check_cancel(self.stop)
                 raise TransportError("mailbox", "邮件列表读取失败：" + safe_error(exc, self.cfg)) from None

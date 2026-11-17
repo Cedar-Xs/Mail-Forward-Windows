@@ -34,8 +34,8 @@ class PopInputValidationTests(unittest.TestCase):
                     cfg = replace(self.cfg, pop_security=security,
                                   **{field: "fake-private-value" + newline + "DELE 1"})
                     with self.subTest(field=field, newline=repr(newline), security=security), \
-                         patch("mailclient.transports.poplib.POP3_SSL") as encrypted, \
-                         patch("mailclient.transports.poplib.POP3") as plain, \
+                         patch("mailclient.transports._ClosingPOP3SSL") as encrypted, \
+                         patch("mailclient.transports._ClosingPOP3") as plain, \
                          patch("mailclient.transports.pop_context") as tls:
                         with self.assertRaises(TransportError) as caught:
                             with pop_session(cfg):
@@ -53,7 +53,7 @@ class PopInputValidationTests(unittest.TestCase):
         cfg.validate(require_channels=False)
         self.assertEqual(cfg.pop_password, "  fake password with spaces  ")
         connection = MagicMock()
-        with patch("mailclient.transports.poplib.POP3_SSL", return_value=connection):
+        with patch("mailclient.transports._ClosingPOP3SSL", return_value=connection):
             with pop_session(cfg) as mailbox:
                 self.assertIs(mailbox, connection)
         connection.user.assert_called_once_with(cfg.pop_user)
@@ -64,8 +64,8 @@ class PopInputValidationTests(unittest.TestCase):
         stop = threading.Event()
         stop.set()
         cfg = replace(self.cfg, pop_password="fake\r\nDELE 1")
-        with patch("mailclient.transports.poplib.POP3_SSL") as encrypted, \
-             patch("mailclient.transports.poplib.POP3") as plain:
+        with patch("mailclient.transports._ClosingPOP3SSL") as encrypted, \
+             patch("mailclient.transports._ClosingPOP3") as plain:
             with self.assertRaises(Cancelled):
                 with pop_session(cfg, stop_event=stop):
                     self.fail("Cancelled sessions must never open a mailbox")

@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import MagicMock, Mock, patch
 
 from mailclient.config import Config
+from mailclient.cancellation import Cancelled
 from mailclient.engine import Forwarder
 from mailclient.health import ConnectivityMonitor
 from mailclient.parsing import Mail
@@ -120,6 +121,17 @@ class ConnectivityIntegrationTests(unittest.TestCase):
             self.assertEqual(record["success_sent_at"], self.now - 60)
             self.assertEqual(record["failure_sent_at"], self.now - 60)
 
+    def test_list_cancellation_is_never_counted_as_a_mailbox_failure(self):
+        for operation in ("stat", "uidl"):
+            with self.subTest(operation=operation):
+                pop = MagicMock()
+                pop.stat.return_value = (0, 0)
+                getattr(pop, operation).side_effect = Cancelled()
+                with self.mailbox(pop), self.assertRaises(Cancelled):
+                    self.engine.poll_once(self.state)
+                self.assertEqual(self.monitor.record["failures"], 0)
+                self.assertEqual(self.sent, [])
+
     def test_mail_retrieval_failure_after_valid_list_does_not_count_as_connection_failure(self):
         self.state.initialize([], False)
         pop = FakePop([("new", raw_mail())])
@@ -162,7 +174,7 @@ class ConnectivityIntegrationTests(unittest.TestCase):
         observer = Mock()
         with patch("mailclient.transports.socket.getaddrinfo"), \
              patch("mailclient.transports.socket.create_connection"), \
-             patch("mailclient.transports.poplib.POP3_SSL", return_value=pop), \
+             patch("mailclient.transports._ClosingPOP3SSL", return_value=pop), \
              patch("mailclient.transports.send_wecom") as sender:
             result = diagnose(self.cfg, mailbox_only=True, connectivity=observer)
         self.assertTrue(result.mailbox_ok)
@@ -177,7 +189,7 @@ class ConnectivityIntegrationTests(unittest.TestCase):
         self.monitor.sender = Mock(side_effect=OSError("health notification failed"))
         with patch("mailclient.transports.socket.getaddrinfo"), \
              patch("mailclient.transports.socket.create_connection"), \
-             patch("mailclient.transports.poplib.POP3_SSL", return_value=pop), \
+             patch("mailclient.transports._ClosingPOP3SSL", return_value=pop), \
              patch("mailclient.transports.send_wecom") as test_sender:
             result = diagnose(self.cfg, stop_event=self.stop, connectivity=self.monitor)
         self.assertTrue(result.can_forward)

@@ -145,6 +145,41 @@ def close_pop(connection, immediate=False):
             pass
 
 
+class _CloseOnInitFailure:
+    """POP3 constructors must close resources when the greeting cannot be read."""
+
+    def __init__(self, *args, **kwargs):
+        self.sock = self.file = None
+        try:
+            super().__init__(*args, **kwargs)
+        except BaseException:
+            try:
+                self.close()
+            except BaseException:
+                # Keep the original connection/greeting failure, even if close
+                # itself fails on a partially initialized socket or reader.
+                pass
+            raise
+
+
+class _ClosingPOP3(_CloseOnInitFailure, poplib.POP3):
+    pass
+
+
+class _ClosingPOP3SSL(_CloseOnInitFailure, poplib.POP3_SSL):
+    def _create_socket(self, timeout):
+        raw = poplib.POP3._create_socket(self, timeout)
+        try:
+            return self.context.wrap_socket(raw, server_hostname=self.host)
+        except BaseException:
+            # The base SSL constructor has not yet assigned self.sock here.
+            try:
+                raw.close()
+            except BaseException:
+                pass
+            raise
+
+
 @contextmanager
 def pop_session(cfg: Config, emit=silent_emit, stop_event=None):
     check_cancel(stop_event)
@@ -160,10 +195,10 @@ def pop_session(cfg: Config, emit=silent_emit, stop_event=None):
                 check_cancel(stop_event)
                 emit("status", key="network", level="busy", text="正在连接邮箱…")
                 if cfg.pop_security == "SSL/TLS":
-                    connection = poplib.POP3_SSL(cfg.pop_host, cfg.pop_port, timeout=cfg.timeout_seconds,
-                                                context=pop_context(cfg))
+                    connection = _ClosingPOP3SSL(cfg.pop_host, cfg.pop_port, timeout=cfg.timeout_seconds,
+                                                 context=pop_context(cfg))
                 else:
-                    connection = poplib.POP3(cfg.pop_host, cfg.pop_port, timeout=cfg.timeout_seconds)
+                    connection = _ClosingPOP3(cfg.pop_host, cfg.pop_port, timeout=cfg.timeout_seconds)
                 sockets.enter_context(watch_socket(stop_event, connection.sock))
                 if cfg.pop_security == "STARTTLS":
                     connection.stls(context=pop_context(cfg))

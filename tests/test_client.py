@@ -334,7 +334,7 @@ class TransportTests(unittest.TestCase):
     def test_pop_password_rejection_closes_connection(self):
         connection = MagicMock()
         connection.pass_.side_effect = poplib.error_proto("-ERR auth")
-        with patch("mailclient.transports.poplib.POP3_SSL", return_value=connection):
+        with patch("mailclient.transports._ClosingPOP3SSL", return_value=connection):
             with self.assertRaises(TransportError) as error:
                 with pop_session(valid_config()):
                     pass
@@ -344,7 +344,7 @@ class TransportTests(unittest.TestCase):
     def test_pop_tls_verifies_by_default(self):
         import ssl
         connection = MagicMock()
-        with patch("mailclient.transports.poplib.POP3_SSL", return_value=connection) as connect:
+        with patch("mailclient.transports._ClosingPOP3SSL", return_value=connection) as connect:
             with pop_session(valid_config()):
                 pass
             context = connect.call_args.kwargs["context"]
