@@ -23,6 +23,7 @@ class ConnectivityMonitor:
         self.sender = sender
         self.last_wecom = 0.0
         self.success_pending = True
+        self._notice_keys = {}
         self.record = {"failures": 0, "failure_sent_at": None, "success_sent_at": None,
                        "failure_attempt_at": None, "success_attempt_at": None}
         try:
@@ -46,6 +47,12 @@ class ConnectivityMonitor:
 
     def _warning(self, message, exc):
         self.emit("log", level="WARNING", text=message + "：" + self._reason(exc))
+
+    def _notice(self, key, text):
+        category = key[:2] if isinstance(key, tuple) else key
+        if self._notice_keys.get(category) != key:
+            self._notice_keys[category] = key
+            self.emit("log", level="INFO", text=text)
 
     def _save(self):
         try:
@@ -77,15 +84,26 @@ class ConnectivityMonitor:
 
     def _notify(self, kind, mail):
         if not self.cfg.wecom_enabled or not self.cfg.wecom_webhook:
+            self._notice("disabled", "邮箱状态通知未发送：企业微信通道未启用或未配置 Webhook。")
             return None
         now = self.clock()
         sent_at = self.record[kind + "_sent_at"]
         if sent_at is not None and now - sent_at < self.COOLDOWN_SECONDS:
+            try:
+                eligible = datetime.fromtimestamp(sent_at + self.COOLDOWN_SECONDS).astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+            except (OverflowError, OSError, ValueError):
+                # A damaged timestamp must not make an optional log message
+                # interrupt mailbox processing or bypass the existing cooldown.
+                next_allowed = ""
+            else:
+                next_allowed = f"，下次允许时间 {eligible}"
+            self._notice((kind, "cooldown", sent_at), f"{mail.subject}通知未发送：12 小时限频中{next_allowed}。")
             if kind == "success":
                 self.success_pending = False
             return None
         attempted_at = self.record[kind + "_attempt_at"]
         if attempted_at is not None and now - attempted_at < self.RETRY_SECONDS:
+            self._notice((kind, "retry", attempted_at), f"{mail.subject}通知等待重试：上次尝试未满 60 秒。")
             return None
         self.record[kind + "_attempt_at"] = now
         self._save()
@@ -95,17 +113,20 @@ class ConnectivityMonitor:
             raise
         except Exception as exc:
             self._warning("连通提醒发送失败，将按重试间隔重试", exc)
+            self.emit("status", key="wecom", level="error", text="邮箱状态通知发送失败 · 等待重试")
             return False
         self.record[kind + "_sent_at"] = self.clock()
         if kind == "success":
             self.success_pending = False
         self._save()
+        self.emit("status", key="wecom", level="ok", text="企业微信已接受" + mail.subject + "通知")
         self.emit("log", level="INFO", text=mail.subject + "提醒已被企业微信接口接受。")
         return True
 
     def success(self, count: int):
         check_cancel(self.stop_event)
         if self.record["failures"]:
+            self.emit("log", level="INFO", text="邮箱检查已恢复成功，连续失败计数已清零。")
             self.record["failures"] = 0
             self._save()
         if not self.success_pending:
@@ -123,6 +144,7 @@ class ConnectivityMonitor:
         self.success_pending = True
         self._save()
         if self.record["failures"] < self.FAILURE_THRESHOLD:
+            self.emit("log", level="INFO", text=f"邮箱检查连续失败 {self.record['failures']}/{self.FAILURE_THRESHOLD} 次，达到阈值后尝试企业微信告警。")
             return None
         stage = {"network": "邮箱网络", "login": "账号登录", "mailbox": "邮件列表读取"}.get(
             getattr(exc, "stage", None), "邮箱检查")

@@ -78,6 +78,20 @@ class ConnectivityTests(unittest.TestCase):
         self.assertTrue(restarted.failure(self.error))
         self.assertEqual(restarted.record["failures"], 3)
 
+    def test_unrenderable_persisted_cooldowns_still_suppress_without_raising(self):
+        for kind in ("success", "failure"):
+            with self.subTest(kind=kind):
+                self.emit.reset_mock()
+                self.state.saved = {kind + "_sent_at": 1e99}
+                monitor = self.make_monitor()
+                result = monitor.success(0) if kind == "success" else self.fail_three(monitor)
+                self.assertIsNone(result)
+                self.assertEqual(self.sent, [])
+                if kind == "success":
+                    self.assertFalse(monitor.success_pending)
+                self.assertTrue(any("12 小时限频中" in call.kwargs.get("text", "")
+                                    for call in self.emit.call_args_list))
+
     def test_success_and_failure_cooldowns_are_independent(self):
         self.assertTrue(self.monitor.success(0))
         self.tick()
@@ -227,6 +241,30 @@ class ConnectivityTests(unittest.TestCase):
         with patch("mailclient.health.send_wecom") as sender:
             self.assertTrue(monitor.success(0))
         self.assertTrue(sender.call_args.kwargs["notification"])
+
+    def test_suppression_and_threshold_are_visible_without_log_flooding(self):
+        self.monitor.failure(self.error)
+        self.monitor.failure(self.error)
+        self.assertTrue(self.monitor.success(0))
+        self.tick()
+        restarted = self.make_monitor()
+        for _ in range(4):
+            restarted.success(0)
+        logs = [call.kwargs.get("text", "") for call in self.emit.call_args_list]
+        self.assertTrue(any("1/3" in line for line in logs))
+        self.assertTrue(any("2/3" in line for line in logs))
+        self.assertTrue(any("已清零" in line for line in logs))
+        self.assertEqual(sum("12 小时限频中" in line for line in logs), 1)
+        self.assertTrue(any("下次允许时间" in line for line in logs))
+
+    def test_notice_cache_stays_bounded_across_many_retries(self):
+        monitor = self.make_monitor(sender=Mock(side_effect=OSError("offline")))
+        for _ in range(50):
+            monitor.success(0)
+            self.tick(1)
+            monitor.success(0)
+            self.tick(60)
+        self.assertLessEqual(len(monitor._notice_keys), 2)
 
 
 if __name__ == "__main__":

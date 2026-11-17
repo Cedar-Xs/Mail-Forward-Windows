@@ -40,6 +40,7 @@ class ClientWindow(IOSLayout):
             cfg, self.load_warning = Config(), str(exc)
         self.active_config = cfg
         self.checked_config = None
+        self.last_wecom = 0.0
         self.events = queue.Queue()
         self.stop_event = CancellationEvent()
         self.worker = None
@@ -122,48 +123,48 @@ class ClientWindow(IOSLayout):
         self.active_config = cfg
         self.stop_event.clear()
         self.set_busy(True)
-        self.phase_var.set("正在检测…")
+        self.phase_var.set("正在启动监测…" if mode == "start" else "正在检测…")
         for key in ("network", "login", "mailbox"):
             self._status(key, "idle", "等待检测")
         if mode != "mailbox":
             for key, enabled in (("wecom", cfg.wecom_enabled), ("smtp", cfg.smtp_enabled)):
                 self._status(key, "idle" if enabled else "off", "等待检测" if enabled else "未启用")
-        already_checked = self.checked_config == cfg
-
         def job():
             health_state = None
+            connectivity = None
             try:
-                connectivity = None
                 if mode != "mailbox":
                     health_state = StateStore(self.folder / "delivery.sqlite3", cfg.account_id)
                     connectivity = ConnectivityMonitor(cfg, health_state, self.stop_event, self.post)
+                    connectivity.last_wecom = self.last_wecom
                 if mode == "mailbox":
                     ok = diagnose(cfg, self.post, mailbox_only=True, stop_event=self.stop_event)
                     self.post("phase", text="检测已停止" if ok.cancelled else ("邮箱检测完成" if ok else "邮箱检测失败"))
+                elif mode == "start":
+                    # Starting monitoring must work while the mailbox or a
+                    # delivery channel is down. poll_once verifies the mailbox
+                    # before accessing mail, and owns retries and health counts.
+                    if not self.stop_event.is_set():
+                        self.post("phase", text="正在监测 · 自动重试与转发")
+                        engine = Forwarder(cfg, self.folder, self.stop_event, self.post, connectivity=connectivity)
+                        engine.run()
+                    self.post("phase", text="转发已停止")
                 else:
-                    if mode == "start" and already_checked:
-                        ok, can_start = True, True
-                    else:
-                        result = diagnose(cfg, self.post, stop_event=self.stop_event, connectivity=connectivity)
-                        ok, can_start = bool(result), result.can_forward
+                    result = diagnose(cfg, self.post, stop_event=self.stop_event, connectivity=connectivity)
+                    ok, can_start = bool(result), result.can_forward
                     if can_start:
                         self.post("diagnosed", config=replace(cfg))
-                    if mode == "start" and can_start and not self.stop_event.is_set():
-                        if not ok:
-                            self.post("log", level="WARNING", text="部分通道检测失败：可用通道继续转发，失败通道会按轮询重试。")
-                        self.post("phase", text="正在转发 · 自动轮询")
-                        engine = Forwarder(cfg, self.folder, self.stop_event, self.post, connectivity=connectivity)
-                        engine.last_wecom = time.monotonic()
-                        engine.run()
-                        self.post("phase", text="转发已停止")
-                    else:
-                        text = "检测通过 · 可开始转发" if ok else ("部分通道异常 · 可启动重试" if can_start else "检测未通过 · 请查看日志")
-                        self.post("phase", text="检测已停止" if self.stop_event.is_set() else text)
+                    text = "检测通过 · 可开始转发" if ok else "检测未通过 · 可开始持续监测重试"
+                    self.post("phase", text="检测已停止" if self.stop_event.is_set() else text)
             except Exception as exc:
                 self.post("log", level="ERROR", text="任务已停止：" + safe_error(exc, cfg))
                 self.post("phase", text="任务异常 · 请查看日志")
             finally:
                 try:
+                    if connectivity is not None:
+                        # Tasks run serially; keep failed attempts too so a
+                        # check/start/stop sequence cannot bypass webhook pacing.
+                        self.last_wecom = connectivity.last_wecom
                     if health_state is not None:
                         health_state.close()
                 finally:
