@@ -278,7 +278,7 @@ class IOSLayout:
         self.label(exclusions, "填写完整邮箱，多个用逗号或分号分隔；留空不排除。忽略大小写，只匹配发件地址。\n"
                    "优先于关键词和首次测试，也会停止名单中邮件的失败重试。移除后仅处理后续新邮件。", 11, MUTED,
                    wraplength=550, justify="left").grid(row=1, column=0, sticky="w", pady=(8, 4))
-        self.note(policy, "修改规则前请先停止转发，保存后重新开始；原邮箱邮件不会被删除。", 2)
+        self.note(policy, "开始转发会持续监测：邮箱连续失败 3 次通过企微告警；首次连通成功也会通知，两类各限 12 小时一次。需启用企微通道。修改规则前请先停止。", 2)
 
         _, _, log_body = self.card(logs, 0, "实时运行记录", "查看连接、登录、通道检测和邮件投递结果", "log")
         log_body.rowconfigure(0, weight=1)
@@ -308,7 +308,7 @@ class IOSLayout:
         self.stop_button.pack(side="left", padx=(0, 8))
         self.mail_test_button = self.button(buttons, "仅检测邮箱", lambda: self.launch("mailbox"), width=116)
         self.mail_test_button.pack(side="left")
-        self.label(actions, "检测会发送测试通知；开始转发前会验证尚未检测的配置。", 11, MUTED).pack(anchor="w", padx=19, pady=(0, 13))
+        self.label(actions, "登录并检测仅检查一次；开始转发会持续监测并自动重试，邮箱暂不可用也能启动。", 11, MUTED).pack(anchor="w", padx=19, pady=(0, 13))
         bottom = ctk.CTkFrame(main, fg_color="transparent")
         bottom.grid(row=4, column=0, sticky="ew", pady=(12, 0))
         self.stats_var = tk.StringVar()
@@ -341,6 +341,8 @@ class IOSLayout:
         text = self.phase_var.get()
         if "正在转发" in text:
             title, fg, color = "●  转发中", "#E6F7EF", GREEN
+        elif "正在监测" in text:
+            title, fg, color = "●  自动重试" if "失败" in text else "●  监测中", "#E8F1FF", BLUE
         elif "失败" in text or "异常" in text or "未通过" in text:
             title, fg, color = "●  需要检查", "#FFF0F1", COLORS["error"]
         elif "通过" in text or "完成" in text:

@@ -51,14 +51,19 @@ class Forwarder:
 
     def _poll_mailbox(self, state: StateStore) -> None:
         with pop_session(self.cfg, self.emit, self.stop) as connection:
-            count, _ = connection.stat()
-            check_cancel(self.stop)
-            items = uidl_list(connection)
+            try:
+                count, _ = connection.stat()
+                check_cancel(self.stop)
+                items = uidl_list(connection)
+            except Exception as exc:
+                check_cancel(self.stop)
+                raise TransportError("mailbox", "邮件列表读取失败：" + safe_error(exc, self.cfg)) from None
             check_cancel(self.stop)
             self._mailbox_ready = True
             self.emit("status", key="mailbox", level="ok", text=f"{count} 封邮件 · UIDL 正常")
             if len(items) != count:
                 self.emit("log", level="WARNING", text="服务器 STAT 与 UIDL 数量不一致，转发以 UIDL 列表为准。")
+            self.emit("phase", text="正在转发 · 邮箱检查正常")
             self.connectivity.success(count)
             if not state.initialized:
                 state.initialize([uid for _, uid in items], self.cfg.test_latest_first_run)
@@ -129,7 +134,6 @@ class Forwarder:
                     self.emit("status", key=channel, level="ok", text="接口已接受消息" if channel == "wecom" else "SMTP 已接受邮件")
                     self.emit("counter", key="delivered", amount=1)
                     self.emit("log", level="INFO", text=f"{'企业微信' if channel == 'wecom' else 'SMTP'}投递成功，状态已保存。")
-            self.emit("checked", time=datetime.now().strftime("%H:%M:%S"))
 
     def run(self) -> None:
         state = StateStore(self.folder / "delivery.sqlite3", self.cfg.account_id)
@@ -155,6 +159,9 @@ class Forwarder:
                         self.emit("status", key="mailbox", level="idle", text="等待重新登录")
                     self.emit("counter", key="failed", amount=1)
                     self.emit("log", level="ERROR", text="本轮检查失败，将自动重试：" + safe_error(exc, self.cfg))
+                    self.emit("phase", text="正在监测 · 邮箱检查失败，等待重试")
+                finally:
+                    self.emit("checked", time=datetime.now().strftime("%H:%M:%S"))
                 if self.stop.wait(self.cfg.poll_seconds):
                     break
         finally:

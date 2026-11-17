@@ -87,6 +87,8 @@ class Config:
 
     def validate(self, require_channels: bool = True) -> None:
         self.validate_excluded_senders()
+        if any(char in self.pop_user or char in self.pop_password for char in "\r\n"):
+            raise ConfigError("POP3 账号和密码不能包含换行符，请重新输入。")
         if not self.pop_host.strip() or not self.pop_user.strip() or not self.pop_password:
             raise ConfigError("请填写公司 POP3 服务器、邮箱账号和密码。")
         if any(c in self.pop_host for c in "/\\ \t\r\n") or self.pop_host != self.pop_host.strip():

@@ -82,7 +82,7 @@ class ConnectivityIntegrationTests(unittest.TestCase):
     def test_stat_and_uidl_must_both_succeed_before_success_is_reported(self):
         pop = MagicMock()
         pop.stat.side_effect = poplib.error_proto(b"-ERR STAT unavailable")
-        with self.mailbox(pop), self.assertRaises(poplib.error_proto):
+        with self.mailbox(pop), self.assertRaises(TransportError):
             self.engine.poll_once(self.state)
         self.assertEqual(self.monitor.record["failures"], 1)
         self.assertEqual(self.sent, [])
@@ -97,6 +97,28 @@ class ConnectivityIntegrationTests(unittest.TestCase):
             self.engine.poll_once(self.state)
         self.assertEqual(self.monitor.record["failures"], 0)
         self.assertEqual([mail.subject for mail in self.sent], ["邮箱连通成功"])
+
+    def test_reopening_sqlite_keeps_success_and_failure_cooldowns_independently(self):
+        path = self.folder / "restarted.sqlite3"
+        error = TransportError("network", "simulated network outage")
+        with closing(StateStore(path, self.cfg.account_id)) as state:
+            monitor = ConnectivityMonitor(self.cfg, state, self.stop, clock=lambda: self.now,
+                                           sender=lambda cfg, mail, **kw: self.sent.append(mail))
+            self.assertTrue(monitor.success(0))
+            for _ in range(3):
+                monitor.failure(error)
+            self.assertEqual([mail.subject for mail in self.sent], ["邮箱连通成功", "邮箱连接异常"])
+        self.now += 60
+        with closing(StateStore(path, self.cfg.account_id)) as state:
+            restarted = ConnectivityMonitor(self.cfg, state, self.stop, clock=lambda: self.now,
+                                             sender=lambda cfg, mail, **kw: self.sent.append(mail))
+            self.assertIsNone(restarted.success(0))
+            for _ in range(3):
+                self.assertIsNone(restarted.failure(error))
+            self.assertEqual(len(self.sent), 2)
+            record = state.load_connectivity()
+            self.assertEqual(record["success_sent_at"], self.now - 60)
+            self.assertEqual(record["failure_sent_at"], self.now - 60)
 
     def test_mail_retrieval_failure_after_valid_list_does_not_count_as_connection_failure(self):
         self.state.initialize([], False)

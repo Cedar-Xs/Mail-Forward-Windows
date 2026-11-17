@@ -1,5 +1,6 @@
 """Login failure details must be useful without exposing echoed credentials."""
 from dataclasses import replace
+import itertools
 import poplib
 import threading
 import traceback
@@ -8,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 from mailclient.cancellation import Cancelled
 from mailclient.config import Config
-from mailclient.transports import TransportError, diagnose, pop_session
+from mailclient.transports import TransportError, diagnose, pop_session, safe_error
 
 
 class LoginDiagnosticsTests(unittest.TestCase):
@@ -150,6 +151,88 @@ class LoginDiagnosticsTests(unittest.TestCase):
         connection.user.assert_called_once_with(cfg.pop_user)
         connection.pass_.assert_called_once_with(cfg.pop_password)
         connection.quit.assert_called_once()
+
+    def test_stat_and_uidl_errors_hide_bytes_echoes_before_status_and_log(self):
+        cfg = replace(self.cfg, pop_password="口令'\\private-secret", smtp_user="sender@example.test",
+                      smtp_password="另一口令\\smtp-secret", smtp_host="smtp.example.test",
+                      wecom_webhook="https://example.test/send?key=FAKE-ROBOT-KEY")
+        values = (cfg.pop_user, cfg.pop_host, cfg.pop_password, cfg.smtp_user,
+                  cfg.smtp_host, cfg.smtp_password, cfg.wecom_webhook)
+        text = "-ERR mailbox unavailable " + " | ".join(values)
+        replies = [text.encode("utf-8"), text.encode("gb18030"),
+                   b"-ERR mailbox unavailable " + cfg.pop_password.encode("utf-8") + b" | " +
+                   cfg.smtp_password.encode("gb18030") + b" | " + cfg.pop_user.upper().encode() + b"\xff"]
+        for command in ("stat", "uidl"):
+            for reply in replies:
+                with self.subTest(command=command, reply=reply):
+                    connection = MagicMock()
+                    connection.stat.return_value = (0, 0)
+                    connection.uidl.return_value = (b"+OK", [], 0)
+                    getattr(connection, command).side_effect = poplib.error_proto(reply)
+                    events = []
+                    with patch("mailclient.transports.socket.getaddrinfo"), \
+                         patch("mailclient.transports.socket.create_connection"), \
+                         patch("mailclient.transports.poplib.POP3_SSL", return_value=connection):
+                        result = diagnose(cfg, lambda kind, **data: events.append((kind, data)),
+                                          mailbox_only=True)
+                    self.assertFalse(result.mailbox_ok)
+                    for kind in ("status", "log"):
+                        messages = [data["text"] for event_kind, data in events
+                                    if event_kind == kind and data.get("level", "").lower() == "error"]
+                        self.assertEqual(len(messages), 1)
+                        self.assertIn("mailbox unavailable", messages[0])
+                        self.assertNotIn("\\x", messages[0])
+                        for value in (*values, "private-secret", "smtp-secret", "FAKE-ROBOT-KEY"):
+                            self.assertNotIn(value.casefold(), messages[0].casefold())
+
+    def test_long_pop_reply_is_redacted_before_truncation(self):
+        cfg = replace(self.cfg, pop_password="口令\\private-secret")
+        reply = b"-ERR " + b"x" * 790 + cfg.pop_password.encode("utf-8") + b" suffix"
+        message = safe_error(poplib.error_proto(reply), cfg)
+        self.assertLessEqual(len(message), 800)
+        self.assertNotIn("口令", message)
+        self.assertNotIn("\\x", message)
+        self.assertNotIn("private-secret", message)
+
+    def test_mailbox_bytes_error_remains_redacted_in_final_health_notification(self):
+        # Exercise the real diagnostic-to-health path, beyond direct string helpers.
+        from mailclient.health import ConnectivityMonitor
+
+        class HealthState:
+            def __init__(self):
+                self.record = {}
+
+            def load_connectivity(self):
+                return dict(self.record)
+
+            def save_connectivity(self, record):
+                self.record = dict(record)
+
+        cfg = replace(self.cfg, wecom_enabled=True, pop_password="口令\\private-secret",
+                      wecom_webhook="https://example.test/send?key=FAKE-ROBOT-KEY")
+        for command in ("stat", "uidl"):
+            with self.subTest(command=command):
+                sent = []
+                connection = MagicMock()
+                connection.stat.return_value = (0, 0)
+                connection.uidl.return_value = (b"+OK", [], 0)
+                reply = b"-ERR mailbox blocked " + cfg.pop_password.encode("utf-8") + b" | " + \
+                    cfg.pop_password.encode("gb18030") + b" | " + cfg.pop_user.upper().encode() + b"\xff"
+                getattr(connection, command).side_effect = poplib.error_proto(reply)
+                monitor = ConnectivityMonitor(cfg, HealthState(), threading.Event(),
+                                               sender=lambda cfg, mail, **kw: sent.append(mail))
+                with patch("mailclient.transports.socket.getaddrinfo"), \
+                     patch("mailclient.transports.socket.create_connection"), \
+                     patch("mailclient.transports.poplib.POP3_SSL", return_value=connection), \
+                     patch("mailclient.transports.send_wecom"), \
+                     patch("mailclient.health.time.monotonic", side_effect=itertools.count(10, 10)):
+                    for _ in range(3):
+                        diagnose(cfg, stop_event=monitor.stop_event, connectivity=monitor)
+                self.assertEqual(len(sent), 1)
+                self.assertEqual(sent[0].subject, "邮箱连接异常")
+                self.assertIn("mailbox blocked", sent[0].plain)
+                for value in (cfg.pop_password, cfg.pop_user, "private-secret", "\\x", "\\\\"):
+                    self.assertNotIn(value.casefold(), sent[0].plain.casefold())
 
 
 if __name__ == "__main__":

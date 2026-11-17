@@ -23,6 +23,9 @@ from .cancellation import (Cancelled, CancellableSocket, check_cancel,
 from .parsing import Mail, truncate_utf8
 
 
+SMTP_MAX_MESSAGE_BYTES = 25 * 1024 * 1024
+
+
 def silent_emit(kind, **data):
     pass
 
@@ -58,6 +61,8 @@ def safe_error(exc: Exception, cfg: Config) -> str:
         message = "连接被拒绝；请检查端口及服务是否开启。"
     elif isinstance(exc, smtplib.SMTPAuthenticationError):
         message = "SMTP 登录失败；请检查账号、授权码 / 密码及 SMTP 服务权限。"
+    elif isinstance(exc, poplib.error_proto):
+        message = _redacted_pop_reply(exc.args[0] if exc.args else "", cfg)
     elif isinstance(exc, urllib.error.HTTPError):
         message = f"转发接口 HTTP 错误：{exc.code}。"
     elif isinstance(exc, urllib.error.URLError):
@@ -72,9 +77,8 @@ def safe_error(exc: Exception, cfg: Config) -> str:
     return message.replace("\r", " ").replace("\n", " ")[:800]
 
 
-def pop_login_error(exc: poplib.error_proto, cfg: Config, command: str) -> str:
-    """Keep the server's explanation, but never expose echoed credentials."""
-    reply = exc.args[0] if exc.args else ""
+def _redacted_pop_reply(reply, cfg: Config) -> str:
+    """Redact POP3 replies before decoding, formatting or truncating bytes."""
     identities = {cfg.pop_user, cfg.smtp_user, cfg.pop_host, cfg.smtp_host}
     private_values = identities | {getattr(cfg, key) for key in SECRET_KEYS}
     private_values.discard("")
@@ -103,7 +107,12 @@ def pop_login_error(exc: poplib.error_proto, cfg: Config, command: str) -> str:
     for value in sorted(private_values, key=len, reverse=True):
         flags = re.IGNORECASE if value in identities else 0
         reply = re.sub(re.escape(value), "[redacted]", reply, flags=flags)
-    reply = safe_error(RuntimeError(reply), cfg)
+    return reply
+
+
+def pop_login_error(exc: poplib.error_proto, cfg: Config, command: str) -> str:
+    """Keep the server's explanation, but never expose echoed credentials."""
+    reply = safe_error(exc, cfg)
     reply = "".join(char if char.isprintable() else " " for char in reply).strip()
     reply = reply[:600] or "服务器未提供具体错误说明。"
     step = "账号提交" if command == "USER" else "密码验证"
@@ -138,6 +147,11 @@ def close_pop(connection, immediate=False):
 
 @contextmanager
 def pop_session(cfg: Config, emit=silent_emit, stop_event=None):
+    check_cancel(stop_event)
+    # poplib interpolates USER/PASS verbatim, including protocol line breaks.
+    # Guard direct callers too, before opening any mailbox connection.
+    if any(char in cfg.pop_user or char in cfg.pop_password for char in "\r\n"):
+        raise TransportError("login", "POP3 账号和密码不能包含换行符，请重新输入。")
     connection = None
     stage = "network"
     with ExitStack() as sockets:
@@ -193,9 +207,12 @@ def uidl_list(connection) -> list[tuple[int, str]]:
     result = []
     for line in lines:
         pieces = line.decode("ascii").split(None, 1)
-        if len(pieces) != 2 or not pieces[0].isdigit() or not pieces[1]:
+        if (len(pieces) != 2 or not pieces[0].isdigit() or
+                int(pieces[0]) < 1 or not pieces[1]):
             raise TransportError("mailbox", "服务器返回了无效 UIDL 列表，已暂停本轮以保护去重状态。")
         result.append((int(pieces[0]), pieces[1]))
+    if len({number for number, _ in result}) != len(result):
+        raise TransportError("mailbox", "服务器返回重复邮件编号，已暂停本轮以保护去重状态。")
     if len({uid for _, uid in result}) != len(result):
         raise TransportError("mailbox", "服务器返回重复 UIDL，无法可靠去重。")
     return sorted(result)
@@ -382,7 +399,8 @@ def build_forward(cfg: Config, mail: Mail) -> EmailMessage:
 def send_smtp(cfg: Config, mail: Mail, stop_event=None) -> None:
     check_cancel(stop_event)
     message = build_forward(cfg, mail)
-    if len(message.as_bytes()) > 25 * 1024 * 1024:
+    # SMTP serializes with CRLF, even when the message's default policy uses LF.
+    if len(message.as_bytes(policy=message.policy.clone(linesep="\r\n"))) > SMTP_MAX_MESSAGE_BYTES:
         raise TransportError("smtp", "转发邮件编码后超过 25 MB；请使用企业微信通知或缩小原邮件附件。")
     with smtp_session(cfg, stop_event) as connection:
         check_cancel(stop_event)

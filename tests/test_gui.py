@@ -6,12 +6,15 @@ import sys
 import tempfile
 import threading
 import tkinter as tk
+from types import SimpleNamespace
 import customtkinter as ctk
 import unittest
 from unittest.mock import patch
 
 from mailclient.config import Config, ConfigStore
+from mailclient.cancellation import Cancelled
 from mailclient.gui import ClientWindow
+from mailclient.parsing import Mail
 from mailclient.transports import DiagnosticResult
 
 
@@ -171,12 +174,93 @@ class GuiTests(unittest.TestCase):
             return DiagnosticResult(cancelled=stop_event.is_set())
         with patch("mailclient.gui.diagnose", side_effect=diagnostic), \
              patch("mailclient.gui.Forwarder") as engine:
-            self.window.launch("start")
+            self.window.launch("check")
             self.assertTrue(entered.wait(1))
             self.window.stop()
             self.finish_worker()
         engine.assert_not_called()
         self.assertEqual(self.window.phase_var.get(), "检测已停止")
+
+    def test_start_enters_polling_without_a_successful_preflight(self):
+        self.set_valid_config()
+        with patch("mailclient.gui.diagnose") as diagnostic, \
+             patch("mailclient.gui.Forwarder") as engine:
+            self.window.launch("start")
+            self.finish_worker()
+        diagnostic.assert_not_called()
+        engine.return_value.run.assert_called_once()
+        self.assertEqual(self.window.phase_var.get(), "转发已停止")
+
+    def test_check_mailbox_and_start_tasks_share_pacing_after_every_send_outcome(self):
+        self.set_valid_config()
+        for outcome in ("accepted", "failed", "cancelled"):
+            with self.subTest(outcome=outcome):
+                self.window.last_wecom = 0.0
+                self.window.checked_config = None
+                now = [100.0]
+                attempted_at = []
+                mailbox_monitors = []
+
+                def advance(delay):
+                    now[0] += delay
+                    return False
+
+                def sender(cfg, mail, stop_event=None):
+                    attempted_at.append(now[0])
+                    if len(attempted_at) == 1:
+                        if outcome == "failed":
+                            raise OSError("simulated webhook failure")
+                        if outcome == "cancelled":
+                            stop_event.set()
+                            raise Cancelled()
+
+                def diagnostic(cfg, emit, mailbox_only=False, connectivity=None, **kwargs):
+                    if mailbox_only:
+                        mailbox_monitors.append(connectivity)
+                        return DiagnosticResult(mailbox_ok=True)
+                    try:
+                        # Exercise the real monitor's attempt timestamp and
+                        # pacing, while keeping the network sender synthetic.
+                        connectivity.deliver(Mail(subject="channel test"), sender=sender)
+                    except Cancelled:
+                        return DiagnosticResult(cancelled=True)
+                    except OSError:
+                        return DiagnosticResult(True, {"wecom": False})
+                    return DiagnosticResult(True, {"wecom": True})
+
+                def forwarder(cfg, folder, stop_event, emit, connectivity=None):
+                    return SimpleNamespace(run=lambda: connectivity.deliver(
+                        Mail(subject="ordinary mail"), sender=sender))
+
+                health_time = SimpleNamespace(time=lambda: 1_000_000 + now[0],
+                                              monotonic=lambda: now[0], sleep=advance)
+                with patch("mailclient.health.time", health_time), \
+                     patch.object(self.window.stop_event, "wait", side_effect=advance) as waited, \
+                     patch("mailclient.gui.diagnose", side_effect=diagnostic) as checked, \
+                     patch("mailclient.gui.Forwarder", side_effect=forwarder) as started:
+                    self.window.launch("check")
+                    self.finish_worker()
+                    self.assertEqual(self.window.last_wecom, 100.0)
+                    waited.assert_not_called()
+
+                    now[0] = 100.5
+                    self.window.launch("mailbox")
+                    self.finish_worker()
+                    self.assertEqual(self.window.last_wecom, 100.0)
+                    self.assertEqual(len(attempted_at), 1)
+                    self.assertEqual(mailbox_monitors, [None])
+                    waited.assert_not_called()
+
+                    now[0] = 101.0
+                    self.window.launch("start")
+                    self.finish_worker()
+                    waited.assert_called_once()
+                    self.assertAlmostEqual(waited.call_args.args[0], 2.2)
+                    self.assertEqual(len(attempted_at), 2)
+                    self.assertAlmostEqual(attempted_at[1] - attempted_at[0], 3.2)
+                    self.assertAlmostEqual(self.window.last_wecom, 103.2)
+                    self.assertEqual(checked.call_count, 2)
+                    started.assert_called_once()
 
 
 if __name__ == "__main__":
